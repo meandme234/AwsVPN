@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+
+#Variable deceleration
+scp_options=(-o StrictHostKeyChecking=no -o NumberOfPasswordPrompts=1 -o ConnectTimeout=30 -o "UserKnownHostsFile /dev/null")
+user='ubuntu'
+local_script="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )/scripts/awsvpn-autoinstall.sh"
+remote_script="\$HOME/awsvpn-autoinstall.sh"
+run_script="sudo bash ./awsvpn-autoinstall.sh"
+remote_path="\$HOME/aws_vpn.ovpn"
+export BOTO_USE_ENDPOINT_HEURISTICS=true
+
+#Terminal colors
+gray='\033[0m'
+green='\033[00;32m'
+red='\033[01;31m'
+white='\033[01;37m'
+yellow='\033[00;33m'
+
+# function for help output
+function usage {
+  # ---------------------------------------------------------------------------
+  echo -e "${white}DESCRIPTION:\n $gray        $(basename "$0") - On Demand AWS awsVPN Endpoint Deployment Tool.\n\t"
+  echo -e "${white}USAGE:\n $gray [OPTIONS]\t [ACION]
+  $white-C$gray\t Create VPN endpoint.
+  $white-D$gray\t Delete keypair from region.
+  $white-G$gray\t Generate new keypair.
+  $white-S$gray\t Get all running instances in a given region.
+  $white-T$gray\t Terminate a awsVPN endpoint.
+  $white-d$gray\t Specify a custom DNS server. (ex. 4.2.2.1)
+  $white-h$gray\t Displays this message.
+  $white-i$gray\t AWS Instance type (Optional, Default is t2.micro)\n\t t2.nano t2.micro t2.small t2.medium t2.large **
+  $white-k$gray\t Specify the name of AWS keypair.
+  $white-m$gray\t Allow multiple connections to same endpoint.
+  $white-r$gray\t Specify AWS Region.\n\t us-east-1 us-east-2 us-west-1 us-west-2 eu-west-1 eu-west-2\n\t\
+ eu-west-3 eu-central-1 eu-north-1 ap-southeast-1 ap-northeast-1 ap-northeast-2\n\t ap-northeast-3 sa-east-1 ap-southeast-2 ap-south-1\
+ ap-east-1 ca-central-1 me-south-1.
+  $white-p$gray\t Specify custom awsVPN UDP port.
+  $white-u$gray\t Specify custom ssh user.***
+  $white-t$gray\t Specify custom timeout (in seconds) which is passed to ssh-keyscan to check whether instance is booted fully.***
+  $white-y$gray\t Skip confirmations
+  $white-z$gray\t Specify instance id."
+  echo -e "${white}EXAMPLES:\n $gray Create awsVPN endpoint: \n\tautovpn -C -r us-east-1 -k us-east-1_vpnkey\n\
+  Generate keypar in a region.\n\tautovpn -G -r us-east-1\n  Get running instances\n\tautovpn -S -r us-west-1\n\
+  Terminate awsVPN endpoint\n\tautovpn -T -r us-west-1 -z i-b933e00c\n  Using custom options\n\
+  \tautovpn -C -r us-east-1 -k us-east-1_vpnkey -a ami-fce3c696 -u ec2_user -i m3.medium"
+  echo -e "${white}NOTES:\n $gray* - Customs ami may be needed if changing instance type.\n $gray** - In reality any\
+  instance size can be given but the t2.micro\n is more than enough.\n\
+ $gray*** - Custom user might be need if using a custom ami.\n **** - AWS IAM user must have EC2 or Administrator permissions set."
+}
+
+#SSH
+sshcmd() {
+  ssh "${scp_options[@]}" -t -t $@
+}
+
+#SCP
+scpcmd() {
+  scp "${scp_options[@]}" $@
+}
+
+#Function for error handling
+bail ()
+{
+  echo -e "${red}Error code $1"
+  usage
+  exit
+}
+
+#create backup of files
+backup ()
+{
+cp ./scripts/$1{,.bak}
+}
+
+#check if file exists before modifications 
+filecheck ()
+{
+  if [[ -f ./scripts/$1.bak ]]; then
+    echo 0
+  else
+    backup "$1"
+    echo 0
+  fi
+}
+
+#Removes temporary files and resets terminal colors
+cleanup ()
+{
+  find ./scripts -type f  -iname "*.bak" -exec bash -c 'git checkout ./scripts/$(basename -s .bak "$1")' _ "{}" \;
+  find ./scripts -type f  -iname "*.bak" -delete
+  tput sgr0
+  unset BOTO_USE_ENDPOINT_HEURISTICS
+  exit
+}
+
+#funtion to provide reason for failure
+failed ()
+{
+  if [ "$1" == "1" ]; then
+  echo -e "${red}Key already exists in AWS\n"
+  elif [ "$1" == "2" ]; then
+  echo -e "${red}\nFailed to terminate instance"
+  elif [ "$1" == "3" ]; then
+  echo -e "${red}\nFailed to delete keypair"
+  fi
+  cleanup
+  exit
+}
+
+#Parse and validate flags
+if ( ! getopts "CDGSTyk:a:d:hmr:i:p:u:z:" opt); then
+  usage;
+  exit 1;
+fi
+
+while getopts ":CDGSTyk:a:d:hmr:i:p:t:u:z:" opt; do
+  case $opt in
+    C) Cflag="defined" ;;
+    D) Dflag="defined" ;;
+    G) Gflag="defined" ;;
+    S) Sflag="defined" ;;
+    T) Tflag="defined" ;;
+    a) custom_ami="$OPTARG" ;;
+    d) custom_DNS="$OPTARG" ;;
+    h) usage && exit 0 ;;
+    i) instance_type="$OPTARG" ;;
+    k) kflag="defined"; keyname="$OPTARG" ;;
+    m) mflag="defined" ;;
+    r) rflag="defined"
+      if [ "$OPTARG" == "us-east-1" ]; then region="us-east-1"; ami="ami-0d5ae5525eb033d0a"
+      elif [ "$OPTARG" == "us-east-2" ]; then region="us-east-2"; ami="ami-0a7f2b5b6b87eaa1b"
+      elif [ "$OPTARG" == "us-west-1" ]; then region="us-west-1"; ami="ami-00a3e4424e9ab3e56"
+      elif [ "$OPTARG" == "us-west-2" ]; then region="us-west-2"; ami="ami-09c6723c6c24250c9"
+      elif [ "$OPTARG" == "eu-west-1" ]; then region="eu-west-1"; ami="ami-0e41581acd7dedd99"
+      elif [ "$OPTARG" == "eu-west-2" ]; then region="eu-west-2"; ami="ami-00f94dc949fea2adf"
+      elif [ "$OPTARG" == "eu-west-3" ]; then region="eu-west-3"; ami="ami-0df03c7641cf41947"
+      elif [ "$OPTARG" == "eu-central-1" ]; then region="eu-central-1"; ami="ami-040a1551f9c9d11ad"
+      elif [ "$OPTARG" == "eu-north-1" ]; then region="eu-north-1"; ami="ami-0567220a328fe4fee"
+      elif [ "$OPTARG" == "ap-northeast-1" ]; then region="ap-northeast-1"; ami="ami-0d5db3e2a1b98ca94"
+      elif [ "$OPTARG" == "ap-northeast-2" ]; then region="ap-northeast-2"; ami="ami-0f4362c71ffaf7759"
+      elif [ "$OPTARG" == "ap-northeast-3" ]; then region="ap-northeast-3"; ami="ami-07672d9af3947230d"
+      elif [ "$OPTARG" == "ap-southeast-1" ]; then region="ap-southeast-1"; ami="ami-0c199cae95cea87f0"
+      elif [ "$OPTARG" == "ap-southeast-2" ]; then region="ap-southeast-2"; ami="ami-0c0483bc96aef8b2f"
+      elif [ "$OPTARG" == "sa-east-1" ]; then region="sa-east-1"; ami="ami-0065a65613972a22a"
+      elif [ "$OPTARG" == "ap-south-1" ]; then region="ap-south-1"; ami="ami-0237472cf337d9529"
+      elif [ "$OPTARG" == "ap-east-1" ]; then region="ap-east-1"; ami="ami-d26218a3"
+      elif [ "$OPTARG" == "ca-central-1" ]; then region="ca-central-1"; ami="ami-0dbe45195223e250b"
+      elif [ "$OPTARG" == "me-south-1" ]; then region="me-south-1"; ami="ami-0a7794ed517908686"
+      else echo "Not a valid region"; bail 3; fi
+      ;;
+    p) vpn_port="$OPTARG" ;;
+    t) tflag="defined"; ssh_keyscan_timeout="$OPTARG" ;;
+    u) custom_user="$OPTARG" ;;
+    y) yflag="defined" ;;
+    z) zflag="defined"; term_ids="$OPTARG" ;;
+    \?) echo "Invalid option: -$OPTARG" >&2 ; bail 1 ;;
+    :)  echo "Option -$OPTARG requires an argument." >&2 ; bail 2
+  esac
+done
+
+if [[ -z "$instance_type" ]]; then 	instance_type="t2.micro"; fi
+if [[ $region =~ ^(eu-north-1|ap-east-1) ]]; then  instance_type="t3.micro"; fi
+if [[ -n "$custom_user" ]]; then  user="$custom_user"; fi
+if [[ -n "$custom_DNS" ]]; then
+  dcheck=$(filecheck awsVPN-autoinstall.sh)
+  [[ $dcheck == "0" ]]
+  sed -i '99,100d' ./scripts/awsVPN-autoinstall.sh
+  sed -i "100i echo 'push \"dhcp-option DNS $custom_DNS\"' >> /etc/awsVPN/server.conf" ./scripts/awsVPN-autoinstall.sh
+fi
+if [[ -z "$vpn_port"  ]]; then
+  vpn_port="1194"
+else
+  pcheck=$(filecheck awsVPN-autoinstall.sh)
+  [[ $pcheck == "0" ]]
+  sed -i "s/1194/$vpn_port/g"  ./scripts/awsVPN-autoinstall.sh
+fi
+if [[ -n "$mflag" ]] ; then
+  mcheck=$(filecheck awsVPN-autoinstall.sh)
+  [[ $mcheck == "0" ]]
+  sed -i "112i echo 'duplicate-cn' >> /etc/awsVPN/server.conf" ./scripts/awsVPN-autoinstall.sh
+fi
+
+local_path="$(pwd)/${region}_aws_vpn.ovpn"
+
+#auto confirm delete when prompted
+confirm ()
+{
+  if [[ -n "$yflag" ]]; then
+    REPLY="Y"
+  else
+    read -p "Are you sure you want to continue? y/n :" -n 1 -r
+  fi
+}
+
+#Create ec2 instance
+if [ -n "$Cflag" ] && [ -n "$rflag" ] && [ -n "$kflag"  ] ; then
+  echo "Creating ec2 instance in $region. This can take some time..."
+  instance_ip=$(python3 ./scripts/create_ec2.py "$keyname" "$instance_type" "$region" "$ami" "$vpn_port")
+  [[ $instance_ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || bail 4
+  echo -e "${green}Instance has been created $instance_ip"
+  echo -e "${yellow}Giving new instance some time to fully boot up..."
+  while [ "$status" != "0" ]
+    do
+      echo -e "${yellow}$instance_ip is still booting..."
+      sleep 15
+            if [[ -n "$tflag" ]]; then
+                ssh-keyscan -T $ssh_keyscan_timeout $instance_ip 2>&1 | grep -v "^$" > /dev/null
+            else
+                ssh-keyscan $instance_ip 2>&1 | grep -v "^$" > /dev/null
+            fi
+    status=$?
+  done
+  echo -e "${white}Setting up VPN on $instance_ip"
+  scpcmd "$local_script" $user@$instance_ip:"$remote_script" || bail 5
+  sshcmd "$user"@$instance_ip "chmod +x $remote_script && $run_script" || bail 6
+  scpcmd $user@$instance_ip:"$remote_path" "$local_path" || bail 7
+  echo -e "${green}awsVPN config file is located at $(pwd)"
+fi
+
+#Generate Keypair
+if [ -n "$Gflag" ] && [ -n "$rflag" ] ; then
+  keypath=$(pwd)
+  if [ ! -f "$keypath/${region}_vpnkey.pem" ]; then
+    echo -e  "${white}Generating new keypair for $region."
+    generate_key=$(python3 ./scripts/keygen.py "${region}_vpnkey" "$region" "$keypath")
+    [[ $generate_key == "Success" ]] || failed 1
+    echo -e "${green}${region}_vpnkey has been created successfully."
+    ssh-add -l &>/dev/null
+    if [ "$?" == 2 ]; then
+      eval $(ssh-agent -s) &>/dev/null
+    fi
+    ssh-add "$keypath/${region}_vpnkey.pem" &>/dev/null
+  elif [ -f "$keypath/${region}_vpnkey.pem" ]; then
+    echo -e "${yellow}A Keypair for this region already exists."
+  fi
+  echo -e "${green}Use ${region}_vpnkey as keyname to create endpoint.\nNote you may need to add ${region}_vpnkey to ssh-agent "
+fi
+
+#Get status
+if [ -n "$Sflag" ] && [ -n "$rflag" ]  ; then
+  get_status=$(python3 ./scripts/get_status.py "$region")
+  if [[ -z ${get_status} ]] ; then
+    echo -e  "${green}No instances running in ${region}"
+  else
+    echo -e "${green}Instances running in ${region}\n ${get_status}"
+  fi
+fi
+
+#Terminate ec2 instance
+if [ -n "$Tflag" ] && [ -n "$rflag" ] && [ -n "$zflag" ]  ; then
+  echo -e "${yellow}WARNING: instance ${term_ids} in ${region} will be terminated. This is not reversible"
+  confirm
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    termec2=$(python3 ./scripts/terminate.py "$region" "$term_ids")
+    [[ $termec2 == "Success" ]] || failed 2
+    echo -e "\n${green}${term_ids} has been terminated."
+  elif [[ $REPLY =~ ^[Nn]$ ]]; then
+    echo -e "\n${green}No instances were terminated."
+  fi
+fi
+
+#Delete keypair from AWS
+if [ -n "$Dflag" ] && [ -n "$rflag" ] && [ -n "$kflag" ]  ; then
+  echo -e "${yellow}WARNING: Keypair ${keyname} in ${region} will be deleted. This is not reversible"
+  confirm
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    delkey=$(python3 ./scripts/delete_key.py "$region" "$keyname")
+    [[ $delkey == "Success" ]] || failed 3
+    echo -e "\n${green}${keyname} has been deleted. Make sure to remove the .pem file on your box "
+  elif [[ $REPLY =~ ^[Nn]$ ]]; then
+    echo -e "\n${green}No keypairs were deleted."
+  fi
+fi
+
+#call cleanup Function
+cleanup
